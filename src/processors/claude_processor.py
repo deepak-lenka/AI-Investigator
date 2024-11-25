@@ -1,347 +1,359 @@
-from anthropic import Anthropic
 import json
 import logging
-from typing import Dict, Optional, List
+from typing import Dict, List, Optional, Union, Any
 from pathlib import Path
-from src.config import (
-    ANTHROPIC_API_KEY,
-    CLAUDE_MODEL,
-    CLAUDE_TEMPERATURE,
-    CLAUDE_MAX_TOKENS,
-    SECTIONS_DIR,
-    REPORTS_INDIVIDUAL_DIR,
-    REPORTS_CROSS_CASE_DIR,
-    REPORTS_EXECUTIVE_DIR
-)
+import anthropic
+from tenacity import retry, stop_after_attempt, wait_exponential
+from datetime import datetime
+from dataclasses import dataclass, asdict
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class AnalysisMetadata:
+    """Metadata for tracking analysis runs"""
+    case_id: str
+    timestamp: str
+    model_version: str
+    analysis_type: str
+    execution_time: float
+    token_usage: Dict[str, int]
+
+class ClaudeProcessorError(Exception):
+    """Base exception for Claude processor errors"""
+    pass
+
+class ValidationError(ClaudeProcessorError):
+    """Raised when response validation fails"""
+    pass
+
 class ClaudeProcessor:
-    def __init__(self):
-        self.client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    """
+    Enhanced Claude processor with optimized prompts, context management, and validation.
+    """
+    
+    def __init__(
+        self,
+        api_key: str = ANTHROPIC_API_KEY,
+        model: str = "claude-3-sonnet-20240229",
+        temperature: float = 0.2,
+        max_tokens: int = 4096,
+        cache_dir: Optional[Path] = None
+    ):
+        """
+        Initialize Claude processor with configuration.
         
-    async def analyze_enterprise_relevance(self, content: str) -> Dict:
-        """Determine if the case study is relevant for enterprise AI analysis"""
-        prompt = """You are an AI expert analyzing enterprise case studies. Review this case study and determine if it describes an enterprise AI implementation case study.
-
-        Key criteria:
-        1. Must be about an established company (not a startup)
-        2. Must describe actual AI/ML implementation (not just plans or general AI discussion)
-        3. Must show enterprise-scale deployment
-        4. Must include clear business outcomes or metrics
-
-        Review the following case study content and provide your analysis in JSON format.
+        Args:
+            api_key: Anthropic API key
+            model: Claude model version
+            temperature: Response randomness (0-1)
+            max_tokens: Maximum response tokens
+            cache_dir: Optional directory for caching responses
+        """
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.cache_dir = cache_dir or Path("./cache")
+        self.cache_dir.mkdir(exist_ok=True)
         
-        Case Study Content:
-        ----------------
-        {content}
-        ----------------
+        # Load prompt templates
+        self.prompts = self._load_prompt_templates()
+        
+        # Initialize analysis history
+        self.analysis_history: List[AnalysisMetadata] = []
 
-        Respond with a JSON object in this exact format, no other text:
-        {{
-            "is_enterprise_ai": true or false,
-            "confidence_score": number between 0 and 1,
-            "company_details": {{
-                "name": "company name",
-                "industry": "industry name",
-                "size_category": "Large Enterprise/Mid-size/Small"
-            }},
-            "ai_implementation": {{
-                "technologies": ["technology1", "technology2"],
-                "scale": "description of deployment scale",
-                "business_areas": ["area1", "area2"]
-            }},
-            "qualification_criteria": {{
-                "established_company": true or false,
-                "business_focus": true or false,
-                "enterprise_scale": true or false,
-                "clear_outcomes": true or false
-            }},
-            "disqualification_reason": null or "reason if not qualified"
-        }}"""
+    def _validate_response(self, response: Dict[str, Any], expected_schema: Dict[str, Any]) -> bool:
+        """
+        Validate Claude's response against expected schema
+        
+        Args:
+            response: Response dictionary from Claude
+            expected_schema: Expected structure and types
+            
+        Raises:
+            ValidationError: If validation fails
+        """
+        try:
+            def validate_dict(data: Dict, schema: Dict, path: str = "") -> None:
+                for key, expected_type in schema.items():
+                    if key not in data:
+                        raise ValidationError(f"Missing key {key} at {path}")
+                    
+                    if isinstance(expected_type, dict):
+                        if not isinstance(data[key], dict):
+                            raise ValidationError(
+                                f"Expected dict for {path}{key}, got {type(data[key])}"
+                            )
+                        validate_dict(data[key], expected_type, f"{path}{key}.")
+                    elif isinstance(expected_type, list):
+                        if not isinstance(data[key], list):
+                            raise ValidationError(
+                                f"Expected list for {path}{key}, got {type(data[key])}"
+                            )
+                    else:
+                        if not isinstance(data[key], expected_type):
+                            raise ValidationError(
+                                f"Expected {expected_type} for {path}{key}, got {type(data[key])}"
+                            )
+            
+            validate_dict(response, expected_schema)
+            return True
+            
+        except ValidationError as e:
+            logger.error(f"Validation error: {str(e)}")
+            raise
+
+    async def _make_claude_request(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        expected_schema: Optional[Dict] = None,
+        cache_key: Optional[str] = None
+    ) -> Dict:
+        """
+        Make request to Claude API with retry, caching, and validation.
+        
+        Args:
+            prompt: Main prompt content
+            system_prompt: Optional system prompt
+            expected_schema: Optional response validation schema
+            cache_key: Optional key for caching
+            
+        Returns:
+            Claude's response parsed as JSON
+        """
+        # Check cache if cache_key provided
+        if cache_key:
+            cache_file = self.cache_dir / f"{cache_key}.json"
+            if cache_file.exists():
+                with open(cache_file) as f:
+                    return json.load(f)
+
+        start_time = datetime.now()
         
         try:
-            # Create message with Claude
-            response = self.client.messages.create(
-                model=CLAUDE_MODEL,
-                temperature=0.1,  # Lower temperature for more consistent JSON
-                max_tokens=CLAUDE_MAX_TOKENS,
-                messages=[{
-                    "role": "user", 
-                    "content": prompt.format(content=content)
-                }]
+            messages = []
+            if system_prompt:
+                messages.append({
+                    "role": "system",
+                    "content": system_prompt
+                })
+                
+            messages.append({
+                "role": "user",
+                "content": prompt
+            })
+            
+            response = await self.client.messages.create(
+                model=self.model,
+                messages=messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens
             )
             
-            # Get response text
-            response_text = response.content[0].text.strip()
-            logger.debug(f"Raw Claude response: {response_text}")
+            parsed_response = json.loads(response.content[0].text)
             
-            # Clean up the response text
-            if '```json' in response_text:
-                response_text = response_text.split('```json')[1].split('```')[0]
-            elif '```' in response_text:
-                response_text = response_text.split('```')[1]
+            # Validate response if schema provided
+            if expected_schema:
+                self._validate_response(parsed_response, expected_schema)
             
-            # Remove any leading/trailing whitespace and newlines
-            response_text = response_text.strip()
+            # Cache response if cache_key provided
+            if cache_key:
+                with open(self.cache_dir / f"{cache_key}.json", "w") as f:
+                    json.dump(parsed_response, f, indent=2)
             
-            try:
-                # Parse JSON
-                analysis = json.loads(response_text)
-                
-                # Log successful analysis
-                logger.info(f"Successfully analyzed content: {json.dumps(analysis, indent=2)}")
-                
-                # Validate required fields
-                required_fields = ['is_enterprise_ai', 'confidence_score', 'company_details', 'qualification_criteria']
-                if not all(field in analysis for field in required_fields):
-                    logger.error(f"Missing required fields. Found: {list(analysis.keys())}")
-                    raise ValueError("Missing required fields in response")
-                
-                return analysis
-                
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON parsing error: {str(e)}")
-                logger.error(f"Response text: {response_text}")
-                
-                # Return default response for JSON parsing errors
-                return {
-                    "is_enterprise_ai": False,
-                    "confidence_score": 0.0,
-                    "company_details": {
-                        "name": "Unknown",
-                        "industry": "Unknown",
-                        "size_category": "Unknown"
-                    },
-                    "ai_implementation": {
-                        "technologies": [],
-                        "scale": "Unknown",
-                        "business_areas": []
-                    },
-                    "qualification_criteria": {
-                        "established_company": False,
-                        "business_focus": False,
-                        "enterprise_scale": False,
-                        "clear_outcomes": False
-                    },
-                    "disqualification_reason": "Failed to parse analysis results"
+            # Record metadata
+            execution_time = (datetime.now() - start_time).total_seconds()
+            metadata = AnalysisMetadata(
+                case_id=cache_key or "unknown",
+                timestamp=datetime.now().isoformat(),
+                model_version=self.model,
+                analysis_type=prompt[:50],  # First 50 chars of prompt
+                execution_time=execution_time,
+                token_usage={
+                    "prompt_tokens": response.usage.input_tokens,
+                    "completion_tokens": response.usage.output_tokens
                 }
-                
+            )
+            self.analysis_history.append(metadata)
+            
+            return parsed_response
+            
         except Exception as e:
-            logger.error(f"Analysis error: {str(e)}")
-            return {
-                "is_enterprise_ai": False,
-                "confidence_score": 0.0,
-                "company_details": {
-                    "name": "Unknown",
-                    "industry": "Unknown",
-                    "size_category": "Unknown"
-                },
-                "ai_implementation": {
-                    "technologies": [],
-                    "scale": "Unknown",
-                    "business_areas": []
-                },
-                "qualification_criteria": {
-                    "established_company": False,
-                    "business_focus": False,
-                    "enterprise_scale": False,
-                    "clear_outcomes": False
-                },
-                "disqualification_reason": f"Error analyzing content: {str(e)}"
-            }
+            logger.error(f"Claude API error: {str(e)}")
+            raise ClaudeProcessorError(f"Claude request failed: {str(e)}")
+
+    async def generate_synthesis_report(self, results: List[Dict]) -> Dict:
+        """
+        Generate a synthesis report from multiple analyses
+        
+        Args:
+            results: List of analysis results
             
-    async def generate_section_analysis(self, content: str, section: str) -> str:
-        """Generate detailed analysis for a specific section"""
-        section_prompts = {
-            "company_context": """
-            Analyze the company context and AI strategy. Focus on:
-            - Company background and industry position
-            - Strategic drivers for AI adoption
-            - Initial AI maturity and capabilities
-            - Strategic objectives and expected outcomes
-            """,
-            
-            "business_challenge": """
-            Analyze the business challenges and opportunities. Focus on:
-            - Key business problems addressed
-            - Market or operational pressures
-            - Existing process limitations
-            - Opportunity assessment and potential impact
-            """,
-            
-            "solution_architecture": """
-            Analyze the AI solution architecture. Focus on:
-            - AI/ML technologies and frameworks used
-            - System architecture and integration points
-            - Data infrastructure and pipelines
-            - Technical capabilities and innovations
-            """,
-            
-            "implementation": """
-            Analyze the implementation approach. Focus on:
-            - Implementation methodology
-            - Team structure and capabilities
-            - Timeline and key milestones
-            - Technical and organizational challenges
-            """,
-            
-            "change_management": """
-            Analyze the change management and adoption. Focus on:
-            - Change management strategy
-            - Training and skill development
-            - User adoption approach
-            - Organizational challenges and solutions
-            """,
-            
-            "business_impact": """
-            Analyze the business impact and lessons. Focus on:
-            - Quantitative business outcomes
-            - Qualitative improvements
-            - ROI and success metrics
-            - Key learnings and best practices
-            """
+        Returns:
+            Synthesis report with patterns and insights
+        """
+        synthesis_prompt = """
+        Analyze these AI implementation results and generate a synthesis report.
+        Focus on patterns, trends, and actionable insights.
+        
+        Analysis results:
+        {results}
+        
+        Generate a synthesis report in JSON format with:
+        1. Key patterns across implementations
+        2. Common success factors
+        3. Shared challenges
+        4. Recommendations
+        5. Industry-specific insights
+        """.format(results=json.dumps(results, indent=2))
+        
+        expected_schema = {
+            "patterns": Dict[str, List[str]],
+            "success_factors": List[str],
+            "challenges": List[str],
+            "recommendations": Dict[str, List[str]],
+            "industry_insights": Dict[str, str]
         }
         
-        prompt = f"""
-        Analyze this enterprise AI case study and provide detailed insights for the {section} section.
-        
-        {section_prompts[section]}
-        
-        Provide your analysis in a clear, structured format with main findings and supporting details.
-        Use markdown formatting for better readability.
-        
-        Case study content:
-        {content}
-        """
-        
-        try:
-            response = self.client.messages.create(
-                model=CLAUDE_MODEL,
-                temperature=CLAUDE_TEMPERATURE,
-                max_tokens=CLAUDE_MAX_TOKENS,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return response.content[0].text
-        except Exception as e:
-            logger.error(f"Error generating {section} analysis: {str(e)}")
-            return None
-            
-    async def save_section_analysis(self, case_id: int, section: str, content: str) -> bool:
-        """Save section analysis to file"""
-        try:
-            case_dir = Path(SECTIONS_DIR) / f"case_{case_id}"
-            case_dir.mkdir(exist_ok=True)
-            
-            with open(case_dir / f"{section}.md", "w", encoding="utf-8") as f:
-                f.write(content)
-                
-            return True
-        except Exception as e:
-            logger.error(f"Error saving {section} analysis for case {case_id}: {str(e)}")
-            return False
+        return await self._make_claude_request(
+            prompt=synthesis_prompt,
+            expected_schema=expected_schema,
+            cache_key=f"synthesis_{datetime.now().strftime('%Y%m%d')}"
+        )
 
-    async def generate_executive_report(self, content: str, analysis: Dict) -> str:
-        """Generate executive report for a qualified case study"""
-        prompt = """Create an executive report for this enterprise AI case study.
-        
-        Previous Analysis:
-        {analysis}
-        
-        Format the report in markdown with these sections:
-        1. Executive Summary
-        2. AI Strategy Analysis
-        3. Technical Implementation Details
-        4. Business Impact Assessment
-        5. Key Success Factors
-        6. Lessons Learned
-        
-        Case Study Content:
-        {content}
-        """
-        
-        try:
-            response = self.client.messages.create(
-                model=CLAUDE_MODEL,
-                temperature=CLAUDE_TEMPERATURE,
-                max_tokens=CLAUDE_MAX_TOKENS,
-                messages=[{
-                    "role": "user", 
-                    "content": prompt.format(
-                        content=content,
-                        analysis=json.dumps(analysis, indent=2)
-                    )
-                }]
+    def export_analysis_history(self, output_path: Optional[Path] = None) -> None:
+        """Export analysis history to JSON file"""
+        if not output_path:
+            output_path = self.cache_dir / "analysis_history.json"
+            
+        with open(output_path, "w") as f:
+            json.dump(
+                [asdict(metadata) for metadata in self.analysis_history],
+                f,
+                indent=2
             )
-            return response.content[0].text
-        except Exception as e:
-            logger.error(f"Error generating executive report: {str(e)}")
-            return None
 
-    async def save_reports(self, case_id: int, content: Dict, analysis: Dict, executive_report: str):
-        """Save all reports for a qualified case study"""
+    async def analyze_implementation_risks(self, content: str) -> Dict:
+        """
+        Analyze potential risks and mitigation strategies
+        
+        Args:
+            content: Case study content
+            
+        Returns:
+            Risk analysis results
+        """
+        risk_prompt = """
+        Analyze potential risks in this AI implementation.
+        Consider technical, organizational, and ethical risks.
+        Provide mitigation strategies for each risk.
+        
+        Content:
+        {content}
+        
+        Respond in JSON format with:
+        1. Risk categories and specific risks
+        2. Impact assessment
+        3. Probability assessment
+        4. Mitigation strategies
+        5. Monitoring recommendations
+        """.format(content=content)
+        
+        expected_schema = {
+            "risks": Dict[str, List[Dict[str, Any]]],
+            "impact_assessment": Dict[str, str],
+            "probability_assessment": Dict[str, float],
+            "mitigation_strategies": Dict[str, List[str]],
+            "monitoring": Dict[str, List[str]]
+        }
+        
+        return await self._make_claude_request(
+            prompt=risk_prompt,
+            expected_schema=expected_schema
+        )
+
+    async def generate_progress_dashboard(self, case_id: str) -> Dict:
+        """
+        Generate a progress tracking dashboard
+        
+        Args:
+            case_id: Case study identifier
+            
+        Returns:
+            Dashboard data
+        """
         try:
-            # Save individual case study report
-            individual_report_path = Path(REPORTS_INDIVIDUAL_DIR) / f"case_{case_id}.md"
-            with open(individual_report_path, "w", encoding="utf-8") as f:
-                f.write(executive_report)
-                
-            # Update cross-case analysis
-            cross_case_path = Path(REPORTS_CROSS_CASE_DIR) / "cross_case_analysis.json"
-            cross_case_data = {}
-            if cross_case_path.exists():
-                with open(cross_case_path, "r") as f:
-                    cross_case_data = json.load(f)
-                    
-            # Add this case study to cross-case analysis
-            cross_case_data[f"case_{case_id}"] = {
-                "company": analysis["company_details"],
-                "technologies": analysis["ai_implementation"]["technologies"],
-                "success_factors": analysis["qualification_criteria"],
-                "business_impact": analysis.get("business_impact", {})
+            # Load all analyses for this case
+            analyses = []
+            case_dir = Path(RAW_CONTENT_DIR) / f"case_{case_id}"
+            analysis_file = case_dir / "claude_analysis.json"
+            
+            if analysis_file.exists():
+                with open(analysis_file) as f:
+                    analyses = json.load(f)
+            
+            # Generate dashboard data
+            dashboard_data = {
+                "case_id": case_id,
+                "last_updated": datetime.now().isoformat(),
+                "analysis_coverage": {
+                    "technical": bool(analyses.get("technical")),
+                    "business": bool(analyses.get("business")),
+                    "risks": bool(analyses.get("risks")),
+                    "lessons": bool(analyses.get("lessons"))
+                },
+                "key_metrics": self._extract_key_metrics(analyses),
+                "status": self._determine_analysis_status(analyses),
+                "next_steps": self._generate_next_steps(analyses)
             }
             
-            with open(cross_case_path, "w") as f:
-                json.dump(cross_case_data, f, indent=2)
-                
-            # Update executive dashboard
-            dashboard_path = Path(REPORTS_EXECUTIVE_DIR) / "executive_dashboard.json"
-            dashboard_data = {}
-            if dashboard_path.exists():
-                with open(dashboard_path, "r") as f:
-                    dashboard_data = json.load(f)
-                    
-            # Add summary to dashboard
-            dashboard_data[f"case_{case_id}"] = {
-                "company": analysis["company_details"]["name"],
-                "industry": analysis["company_details"]["industry"],
-                "confidence_score": analysis["confidence_score"],
-                "implementation_scale": analysis["ai_implementation"]["scale"],
-                "key_technologies": analysis["ai_implementation"]["technologies"]
-            }
-            
-            with open(dashboard_path, "w") as f:
+            # Save dashboard
+            output_path = case_dir / "dashboard.json"
+            with open(output_path, "w") as f:
                 json.dump(dashboard_data, f, indent=2)
-                
-            return True
+            
+            return dashboard_data
             
         except Exception as e:
-            logger.error(f"Error saving reports for case {case_id}: {str(e)}")
-            return False
+            logger.error(f"Dashboard generation failed: {str(e)}")
+            raise ClaudeProcessorError(f"Dashboard generation failed: {str(e)}")
 
-    async def analyze_links(self, prompt: str) -> str:
-        """Analyze links to identify case studies"""
-        try:
-            response = self.client.messages.create(
-                model=CLAUDE_MODEL,
-                temperature=0.2,
-                max_tokens=CLAUDE_MAX_TOKENS,
-                messages=[{
-                    "role": "user", 
-                    "content": prompt
-                }]
-            )
-            return response.content[0].text.strip()
-        except Exception as e:
-            logger.error(f"Error analyzing links: {str(e)}")
-            return "[]"  # Return empty list on error
+    def _extract_key_metrics(self, analyses: Dict) -> Dict:
+        """Extract key metrics from analyses"""
+        metrics = {}
+        if "business" in analyses:
+            metrics["roi"] = analyses["business"].get("quantitative_metrics", {}).get("roi")
+            metrics["efficiency_gains"] = analyses["business"].get("quantitative_metrics", {}).get("efficiency_gains")
+        
+        if "technical" in analyses:
+            metrics["implementation_status"] = analyses["technical"].get("implementation", {}).get("status")
+        
+        return metrics
+
+    def _determine_analysis_status(self, analyses: Dict) -> str:
+        """Determine overall analysis status"""
+        required_analyses = {"technical", "business", "risks", "lessons"}
+        completed = set(analyses.keys())
+        
+        if not completed:
+            return "Not Started"
+        elif completed == required_analyses:
+            return "Complete"
+        else:
+            return f"In Progress ({len(completed)}/{len(required_analyses)})"
+
+    def _generate_next_steps(self, analyses: Dict) -> List[str]:
+        """Generate recommended next steps"""
+        next_steps = []
+        required_analyses = {"technical", "business", "risks", "lessons"}
+        
+        for analysis in required_analyses - set(analyses.keys()):
+            next_steps.append(f"Complete {analysis} analysis")
+            
+        if "risks" in analyses:
+            for risk in analyses["risks"].get("high_priority", []):
+                next_steps.append(f"Address high-priority risk: {risk}")
+                
+        return next_steps

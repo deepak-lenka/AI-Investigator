@@ -1,140 +1,199 @@
+import time
 import logging
-from typing import List, Dict, Optional
-from src.processors.claude_processor import ClaudeProcessor
-from src.config import FIRECRAWL_API_KEY
-from firecrawl import FirecrawlApp
+from typing import Dict, List, Optional
+from urllib.parse import urljoin
+import backoff  # Add to requirements.txt
+import requests
+from requests.exceptions import (
+    RequestException,
+    ConnectionError,
+    Timeout,
+    TooManyRedirects,
+    HTTPError
+)
 
 logger = logging.getLogger(__name__)
 
+class WebsiteCrawlerError(Exception):
+    """Base exception for website crawler errors"""
+    pass
+
+class RateLimitError(WebsiteCrawlerError):
+    """Raised when rate limit is hit"""
+    pass
+
+class CrawlError(WebsiteCrawlerError):
+    """Raised when crawling fails"""
+    pass
+
 class WebsiteCrawler:
-    def __init__(self):
-        self.app = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
-        self.claude_processor = None
-
-    async def find_case_study_links(self, website_url: str, claude_processor: ClaudeProcessor) -> List[Dict[str, str]]:
-        """Find case study links using Firecrawl's map endpoint and Claude's analysis"""
-        self.claude_processor = claude_processor
-        
-        # Normalize the URL
-        if not website_url.startswith(('http://', 'https://')):
-            website_url = 'https://' + website_url
-            
-        print(f"\nStarting crawl of {website_url}")
-        print("This may take a few minutes...")
-
-        try:
-            # Step 1: Use Firecrawl's map endpoint to get ALL website links
-            map_result = self.app.map_url(website_url, params={
-                'includeSubdomains': True
-            })
-            
-            if not map_result or 'links' not in map_result:
-                logger.error("No links found in website map")
-                return []
-
-            all_links = map_result['links']
-            print(f"\nFound {len(all_links)} total links")
-            print("\nAll mapped links:")
-            for i, link in enumerate(all_links):
-                print(f"{i}. {link}")
-            
-            # Step 2: Let Claude analyze ALL links and identify case studies
-            case_studies = await self._identify_case_studies(all_links)
-            return case_studies
-
-        except Exception as e:
-            logger.error(f"Error crawling website {website_url}: {str(e)}")
-            return []
-
-    async def _identify_case_studies(self, links: List[str]) -> List[Dict[str, str]]:
-        """Use Claude to identify which links are likely case studies"""
-        prompt = """You are an expert at identifying case study, customer story, and success story content on company websites.
-
-Carefully analyze the provided URLs and determine which ones are likely to lead to case studies, customer stories, success stories, or similar content.
-
-Look for the following key patterns in the URLs:
-
-1. Direct case study URLs:
-   - /case-studies/
-   - /case-studies/[specific-company-name]
-   - /case-studies/how-[company-name]-used-[product]
-
-2. Customer story URLs:
-   - /customer-stories/
-   - /customer-stories/[company-name]
-   - /customers/[company-name]
-
-3. Success story URLs:
-   - /success-stories/
-   - /success/[company-name]
-
-4. Implementation/use case URLs:
-   - URLs containing "how-[company-name]-used" or "how-to-use"
-   - URLs describing specific product implementations or use cases
-
-5. Customer example URLs:
-   - URLs with [company-name] followed by implementation details
-   - URLs describing specific customer use cases
-
-Additionally, be aware of blog or news-related URLs that may contain case study content:
-
-6. Blog/news URLs:
-   - URLs containing "blog", "blogs", "news", or "newsroom"
-   - URLs with brand names in the path
-
-Analyze the provided list of URLs carefully and thoroughly. Identify ALL URLs that match the patterns above or appear to be case studies, customer stories, or similar content.
-
-Return a JSON list of the indices of all URLs that you believe will lead to case study-related content. Do not include any other text.
-
-Example: [0, 2, 5]
-
-URLs to analyze:
-{urls}
+    def __init__(
+        self,
+        base_url: str,
+        max_retries: int = 3,
+        timeout: int = 30,
+        rate_limit_pause: float = 1.0,
+        max_pages: Optional[int] = None
+    ):
         """
+        Initialize the website crawler with configuration parameters.
+        
+        Args:
+            base_url: The starting URL for crawling
+            max_retries: Maximum number of retry attempts for failed requests
+            timeout: Request timeout in seconds
+            rate_limit_pause: Pause between requests in seconds
+            max_pages: Maximum number of pages to crawl (None for unlimited)
+        """
+        self.base_url = base_url
+        self.max_retries = max_retries
+        self.timeout = timeout
+        self.rate_limit_pause = rate_limit_pause
+        self.max_pages = max_pages
+        self.session = self._create_session()
+        self.crawled_urls = set()
+        self.failed_urls = set()
 
-        # Prepare URLs for Claude
-        urls_data = []
-        for i, url in enumerate(links):
-            urls_data.append(f"{i}. {url}")
+    def _create_session(self) -> requests.Session:
+        """Create and configure requests session with retry mechanism"""
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'AI Case Study Analyzer Bot 1.0',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+        })
+        return session
 
-        print("\nClaude API Request:")
-        print("Prompt:")
-        print(prompt.format(urls='\n'.join(urls_data)))
-
-        # Get Claude's analysis
-        response = await self.claude_processor.analyze_links(
-            prompt.format(urls='\n'.join(urls_data))
-        )
-
-        print("\nClaude API Response:")
-        print(response)
-
+    @backoff.on_exception(
+        backoff.expo,
+        (ConnectionError, Timeout, HTTPError),
+        max_tries=3,
+        jitter=None
+    )
+    async def _make_request(self, url: str) -> Optional[requests.Response]:
+        """
+        Make HTTP request with retry mechanism and error handling.
+        
+        Args:
+            url: URL to request
+            
+        Returns:
+            Response object if successful, None otherwise
+            
+        Raises:
+            RateLimitError: If rate limit is detected
+            CrawlError: For other crawling errors
+        """
         try:
-            case_study_indices = eval(response)  # Safely evaluate the list
+            response = self.session.get(url, timeout=self.timeout)
+            response.raise_for_status()
             
-            # Get the identified case study URLs
-            case_studies = []
-            for i in case_study_indices:
-                if i < len(links):
-                    case_studies.append({
-                        'url': links[i],
-                        'title': self._extract_title_from_url(links[i])
-                    })
+            # Check for rate limiting response codes
+            if response.status_code in (429, 503):
+                retry_after = int(response.headers.get('Retry-After', 60))
+                logger.warning(f"Rate limit hit for {url}. Waiting {retry_after}s")
+                time.sleep(retry_after)
+                raise RateLimitError(f"Rate limited on {url}")
+                
+            time.sleep(self.rate_limit_pause)  # Rate limiting pause
+            return response
+
+        except HTTPError as e:
+            logger.error(f"HTTP error for {url}: {str(e)}")
+            self.failed_urls.add(url)
+            raise CrawlError(f"HTTP error: {str(e)}")
             
-            return case_studies
+        except (ConnectionError, Timeout) as e:
+            logger.error(f"Connection error for {url}: {str(e)}")
+            self.failed_urls.add(url)
+            raise CrawlError(f"Connection error: {str(e)}")
             
         except Exception as e:
-            logger.error(f"Error processing Claude's response: {str(e)}")
-            return []
+            logger.error(f"Unexpected error crawling {url}: {str(e)}")
+            self.failed_urls.add(url)
+            raise CrawlError(f"Unexpected error: {str(e)}")
 
-    def _extract_title_from_url(self, url: str) -> str:
-        """Extract a readable title from URL path"""
+    async def crawl(self) -> Dict[str, List[str]]:
+        """
+        Crawl website starting from base URL with error handling.
+        
+        Returns:
+            Dictionary containing:
+            - 'successful_urls': List of successfully crawled URLs
+            - 'failed_urls': List of URLs that failed
+            - 'skipped_urls': List of URLs skipped due to filters
+        """
+        results = {
+            'successful_urls': [],
+            'failed_urls': list(self.failed_urls),
+            'skipped_urls': []
+        }
+        
         try:
-            # Remove protocol and domain
-            path = url.split('/')[-1]
-            # Convert dashes and underscores to spaces
-            title = path.replace('-', ' ').replace('_', ' ').strip()
-            # Capitalize words
-            return title.title() if title else "Untitled Case Study"
-        except Exception:
-            return "Untitled Case Study"
+            pages_crawled = 0
+            urls_to_crawl = {self.base_url}
+            
+            while urls_to_crawl and (self.max_pages is None or pages_crawled < self.max_pages):
+                url = urls_to_crawl.pop()
+                
+                if url in self.crawled_urls:
+                    continue
+                    
+                try:
+                    response = await self._make_request(url)
+                    if response is None:
+                        continue
+                        
+                    self.crawled_urls.add(url)
+                    results['successful_urls'].append(url)
+                    
+                    # Extract and queue new URLs
+                    new_urls = self._extract_urls(response)
+                    filtered_urls = self._filter_urls(new_urls)
+                    urls_to_crawl.update(filtered_urls)
+                    
+                    pages_crawled += 1
+                    
+                except RateLimitError:
+                    # Already handled in _make_request
+                    continue
+                    
+                except CrawlError as e:
+                    logger.error(f"Crawl error for {url}: {str(e)}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Fatal crawling error: {str(e)}")
+            raise CrawlError(f"Fatal crawling error: {str(e)}")
+            
+        finally:
+            self.session.close()
+            
+        return results
+
+    def _extract_urls(self, response: requests.Response) -> set:
+        """Extract all URLs from the response"""
+        # Add your URL extraction logic here
+        # This is a placeholder implementation
+        return set()
+
+    def _filter_urls(self, urls: set) -> set:
+        """
+        Filter URLs based on criteria:
+        - Same domain
+        - Not already crawled
+        - Matches allowed patterns
+        """
+        filtered = set()
+        for url in urls:
+            # Add your filtering logic here
+            if url.startswith(self.base_url) and url not in self.crawled_urls:
+                filtered.add(url)
+        return filtered
+
+    def get_statistics(self) -> Dict:
+        """Return crawling statistics"""
+        return {
+            'total_urls_crawled': len(self.crawled_urls),
+            'failed_urls': len(self.failed_urls),
+            'success_rate': len(self.crawled_urls) / (len(self.crawled_urls) + len(self.failed_urls)) if self.crawled_urls else 0
+        }
